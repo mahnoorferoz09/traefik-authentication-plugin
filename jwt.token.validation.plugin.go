@@ -3,101 +3,103 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/redis/go-redis/v9"
+	"github.com/golang-jwt/jwt/v4"
 )
 
 type Config struct {
-	RedisAddr string `json:"redisAddr,omitempty"`
-	RedisPass string `json:"redisPass,omitempty"`
-	RedisDB   int    `json:"redisDB,omitempty"`
-	SecretKey string `json:"secretKey,omitempty"`
+	Issuer   string `json:"issuer,omitempty"`
+	Audience string `json:"audience,omitempty"`
+	Secret   string `json:"secret,omitempty"`
 }
 
 func CreateConfig() *Config {
-	return &Config{
-		RedisAddr: "167.253.104.28:6379",
-		RedisPass: "",
-		RedisDB:   0,
-		SecretKey: "admin123!",
-	}
+	return &Config{}
 }
 
 type JWTPlugin struct {
-	next   http.Handler
-	config *Config
-	client *redis.Client
+	next     http.Handler
+	name     string
+	issuer   string
+	audience string
+	secret   string
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     config.RedisAddr,
-		Password: config.RedisPass,
-		DB:       config.RedisDB,
-	})
-
+	log.Println("[JWTPlugin] Initializing with config")
 	return &JWTPlugin{
-		next:   next,
-		config: config,
-		client: rdb,
+		next:     next,
+		name:     name,
+		issuer:   config.Issuer,
+		audience: config.Audience,
+		secret:   config.Secret,
 	}, nil
 }
 
-func (p *JWTPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+func (a *JWTPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	authHeader := req.Header.Get("Authorization")
-	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-		http.Error(rw, "Missing or invalid Authorization header", http.StatusUnauthorized)
+	if authHeader == "" {
+		log.Println("[JWTPlugin] Missing Authorization header")
+		http.Error(rw, "Unauthorized - Missing Authorization header", http.StatusUnauthorized)
 		return
 	}
 
 	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+	if tokenString == authHeader {
+		log.Println("[JWTPlugin] Invalid Authorization header format")
+		http.Error(rw, "Unauthorized - Invalid Authorization header format", http.StatusUnauthorized)
+		return
+	}
 
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		// Ensure signing method is HMAC
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method")
+			log.Printf("[JWTPlugin] Unexpected signing method: %v", token.Header["alg"])
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-		return []byte(p.config.SecretKey), nil
+		log.Println("[JWTPlugin] Using client secret for validation")
+		return []byte(a.secret), nil
 	})
 
-	if err != nil || !token.Valid {
-		http.Error(rw, "Invalid token", http.StatusUnauthorized)
-		return
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		http.Error(rw, "Invalid token claims", http.StatusUnauthorized)
-		return
-	}
-
-	// ✅ Extract user_id and permission_version from token
-	userID := fmt.Sprintf("%v", claims["user_id"])
-	tokenVersion := fmt.Sprintf("%v", claims["user_permission_version"])
-
-	if userID == "" || tokenVersion == "" {
-		http.Error(rw, "Missing claims", http.StatusUnauthorized)
-		return
-	}
-
-	// ✅ Fetch latest version from Redis
-	ctx := context.Background()
-	redisKey := fmt.Sprintf("user:%s:permission_version", userID)
-	latestVersion, err := p.client.Get(ctx, redisKey).Result()
-
 	if err != nil {
-		http.Error(rw, "Redis lookup failed", http.StatusUnauthorized)
+		log.Printf("[JWTPlugin] Error parsing token: %v", err)
+		http.Error(rw, "Unauthorized - Invalid token", http.StatusUnauthorized)
 		return
 	}
 
-	// ✅ Compare versions
-	if latestVersion != tokenVersion {
-		http.Error(rw, "Token expired (permissions updated)", http.StatusUnauthorized)
-		return
-	}
+	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		log.Printf("[JWTPlugin] Token claims: %v", claims)
 
-	// ✅ Pass request forward
-	p.next.ServeHTTP(rw, req)
+		// Validate issuer
+		if claims["iss"] != a.issuer {
+			log.Printf("[JWTPlugin] Invalid issuer. Expected: %s, Got: %s", a.issuer, claims["iss"])
+			http.Error(rw, "Unauthorized - Invalid issuer", http.StatusUnauthorized)
+			return
+		}
+
+		// Validate audience
+		if claims["aud"] != a.audience {
+			log.Printf("[JWTPlugin] Invalid audience. Expected: %s, Got: %s", a.audience, claims["aud"])
+			http.Error(rw, "Unauthorized - Invalid audience", http.StatusUnauthorized)
+			return
+		}
+
+		// Validate user_permissions_version
+		if upv, ok := claims["user_permissions_version"]; ok {
+			log.Printf("[JWTPlugin] Found user_permissions_version: %v", upv)
+		} else {
+			log.Println("[JWTPlugin] Missing user_permissions_version in token")
+			http.Error(rw, "Unauthorized - Missing user_permissions_version", http.StatusUnauthorized)
+			return
+		}
+
+		log.Println("[JWTPlugin] Token validation successful")
+		a.next.ServeHTTP(rw, req)
+	} else {
+		log.Println("[JWTPlugin] Invalid token claims")
+		http.Error(rw, "Unauthorized - Invalid token claims", http.StatusUnauthorized)
+	}
 }
