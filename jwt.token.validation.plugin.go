@@ -1,4 +1,4 @@
-package main
+package jwt_token_validateion_plugin
 
 import (
 	"context"
