@@ -1,0 +1,5 @@
+# .traefik.yml
+displayName: "Authentication and Authorization Plugin"
+type: middleware
+import: github.com/mahnoorferoz09/traefik-authentication-plugin
+summary: "A custom JWT authentication middleware for Traefik."
